@@ -3,78 +3,66 @@ package nobelprize
 import (
 	"context"
 	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes nobelprize as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
+// domain.go registers the nobelprize kit Domain so a blank import in a
+// multi-domain host (ant) enables the driver:
 //
 //	import _ "github.com/tamnd/nobelprize-cli/nobelprize"
 //
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// nobelprize:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone nobelprize binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
+// The Domain also builds the standalone nobelprize binary via NewApp.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the nobelprize driver. It carries no state; the per-run client is
+// Domain is the Nobel Prize driver. It carries no state; the per-run client is
 // built by the factory Register hands kit.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme and the identity the single-site binary inherits.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "nobelprize",
-		Hosts:  []string{Host},
+		Hosts:  []string{Host, "www.nobelprize.org", "nobelprize.org"},
 		Identity: kit.Identity{
 			Binary: "nobelprize",
-			Short:  "A command line for nobelprize.",
-			Long: `A command line for nobelprize.
+			Short:  "Explore Nobel Prize data",
+			Long: `Explore Nobel Prize data via the official Nobel Prize API.
 
-nobelprize reads public nobelprize data over plain HTTPS, shapes it into
+nobelprize reads public Nobel Prize data over plain HTTPS, shapes it into
 clean records, and prints output that pipes into the rest of your tools. No API
 key, nothing to run alongside it.`,
-			Site: Host,
+			Site: "www.nobelprize.org",
 			Repo: "https://github.com/tamnd/nobelprize-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and the two Nobel Prize operations onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `nobelprize page` and
-	// `ant get nobelprize://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "prizes",
+		Group:   "browse",
+		Summary: "List Nobel prizes",
+		Args:    []kit.Arg{{Name: "category", Help: "category filter (optional)", Optional: true}},
+	}, listPrizes)
 
-	// List op: members of a page, the home of `nobelprize links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// nobelprize://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "laureates",
+		Group:   "browse",
+		Summary: "Search Nobel laureates",
+		Args:    []kit.Arg{{Name: "name", Help: "search by name (optional)", Optional: true}},
+	}, listLaureates)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds a Client from the resolved kit Config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
-	if cfg.UserAgent != "" {
-		c.UserAgent = cfg.UserAgent
-	}
+	c := DefaultConfig()
 	if cfg.Rate > 0 {
 		c.Rate = cfg.Rate
 	}
@@ -82,45 +70,38 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	if cfg.UserAgent != "" {
+		c.UserAgent = cfg.UserAgent
+	}
+	return NewClient(c), nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
+// --- input structs ---
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Client *Client `kit:"inject"`
+type prizesInput struct {
+	Category string  `kit:"flag" help:"category: physics, chemistry, medicine, literature, peace, economics"`
+	Year     string  `kit:"flag" help:"award year (e.g., 2023)"`
+	Limit    int     `kit:"flag,inherit" help:"max results"`
+	Client   *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
-	Client *Client `kit:"inject"`
+type laureatesInput struct {
+	Name     string  `kit:"arg" help:"search by name (optional)"`
+	Category string  `kit:"flag" help:"category filter"`
+	Limit    int     `kit:"flag,inherit" help:"max results"`
+	Client   *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func listPrizes(ctx context.Context, in prizesInput, emit func(Prize) error) error {
+	prizes, err := in.Client.ListPrizes(ctx, in.Category, in.Year, in.Limit)
 	if err != nil {
-		return mapErr(err)
+		return err
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
+	for _, p := range prizes {
 		if err := emit(p); err != nil {
 			return err
 		}
@@ -128,46 +109,71 @@ func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full nobelprize.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized nobelprize reference: %q", input)
+func listLaureates(ctx context.Context, in laureatesInput, emit func(Laureate) error) error {
+	laureates, err := in.Client.SearchLaureates(ctx, in.Name, in.Category, in.Limit)
+	if err != nil {
+		return err
 	}
-	return "page", id, nil
+	for _, l := range laureates {
+		if err := emit(l); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
+// --- Resolver ---
+
+// yearRE matches a 4-digit year.
+var yearRE = regexp.MustCompile(`^\d{4}$`)
+
+// knownCategoryNames is the set of human-friendly category names.
+var knownCategoryNames = map[string]bool{
+	"physics":    true,
+	"chemistry":  true,
+	"medicine":   true,
+	"literature": true,
+	"peace":      true,
+	"economics":  true,
+}
+
+// Classify turns any accepted input into the canonical (uriType, id).
+// 4-digit year → ("year", year); known category → ("category", name);
+// anything else → ("laureate", input).
+func (Domain) Classify(input string) (uriType, id string, err error) {
+	if input == "" {
+		return "", "", errs.Usage("nobelprize: empty input")
+	}
+	// strip URL if it's a full URL
+	if u, err2 := url.Parse(input); err2 == nil && (u.Scheme == "http" || u.Scheme == "https") {
+		input = strings.Trim(u.Path, "/")
+	}
+	input = strings.TrimSpace(input)
+	if yearRE.MatchString(input) {
+		return "year", input, nil
+	}
+	lower := strings.ToLower(input)
+	if knownCategoryNames[lower] {
+		return "category", lower, nil
+	}
+	return "laureate", input, nil
+}
+
+// Locate returns the canonical Nobel Prize URL for a (uriType, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "laureate":
+		return "https://www.nobelprize.org/search/?q=" + url.QueryEscape(id), nil
+	case "year":
+		return "https://www.nobelprize.org/prizes/" + id, nil
+	case "category":
+		return "https://www.nobelprize.org/prizes/" + id + "/", nil
+	default:
 		return "", errs.Usage("nobelprize has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// mapErr converts a library error into the kit error kind with the right exit code.
 func mapErr(err error) error {
 	return err
 }
