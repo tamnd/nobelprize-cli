@@ -1,0 +1,10 @@
+title       = "nobelprize"
+baseURL     = "https://nobelprize-cli.tamnd.com/"
+description = "A command line for nobelprize."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/nobelprize-cli"
